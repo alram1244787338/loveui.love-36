@@ -161,6 +161,13 @@ function widget:removewidget(w)
   if not self:owns(w) then
     error("A widget cannot remove a widget it does not own.")
   end
+  -- If the widget being removed currently holds focus, clear it first while
+  -- it is still attached. This fires its blur action, strips its ui.focus
+  -- tag, and drops self.focused, so no later keyboard/mouse-release event is
+  -- dispatched to a widget that has left the tree.
+  if self.focused == w then
+    self:focus(nil)
+  end
   for i, v in ipairs(self.content) do
     if v == w then
       table.remove(self.content, i);
@@ -589,7 +596,10 @@ function widget:focus(w)
     if self.focused then
       self.focused.actions.blur()
     end
-    if self.focused then
+    -- Only strip the tag if it is actually present. The focused widget may
+    -- have been detached from the tree before focus was cleared, in which
+    -- case removetag would error on a tag it no longer owns.
+    if self.focused and self.focused:match("ui.focus") then
       self.focused:remove("ui.focus")
     end
     self.focused = w
@@ -598,6 +608,26 @@ function widget:focus(w)
       self.focused.actions.focus()
     end
   end
+end
+
+--- Returns the currently focused subwidget, but only if it is still a
+-- valid focus target. A focus target is valid when it is either this
+-- widget itself, or a direct child that is still owned by this widget and
+-- is still interactive (see <code>enabled</code>).
+-- If the focused widget has been detached from this widget, reparented, or
+-- can no longer be interacted with (e.g. its style changed to
+-- <code>display: none</code> or it was disabled), its focus state is
+-- cleared first: the <code>blur</code> action fires and the
+-- <code>ui.focus</code> tag is removed. This keeps stale focus from leaking
+-- keyboard or mouse-release events to widgets that left the tree.
+-- @return The focused subwidget, or <code>nil</code> if focus was stale and
+-- has just been cleared.
+function widget:validatefocus()
+  local w = self.focused
+  if w and w ~= self and (w.owner ~= self or not w:enabled()) then
+    self:focus(nil)
+  end
+  return self.focused
 end
 
 function widget:enabled()
@@ -698,9 +728,10 @@ end
 function widget:mousereleased(x, y, button)
   if not self.bounds then self:computebounds() end
   local wx, wy, ww, wh = unpack(self.bounds)
-  if self.focused ~= nil and self.focused ~= self then
-    if self.focused:enabled() and self.focused:contains(x - wx, y - wy) and
-        self.focused:mousereleased(x - wx, y - wy, button)  then
+  local focused = self:validatefocus()
+  if focused ~= nil and focused ~= self then
+    if focused:contains(x - wx, y - wy) and
+        focused:mousereleased(x - wx, y - wy, button)  then
        return true
     end
   end
@@ -714,8 +745,9 @@ function widget:mousereleased(x, y, button)
 end
 
 function widget:keypressed(key, unicode)
-  if self.focused ~= self and self.focused then
-    self.focused:keypressed(key, unicode)
+  local focused = self:validatefocus()
+  if focused ~= self and focused then
+    focused:keypressed(key, unicode)
   end
   if self:enabled() then
     self.actions.keydown(self, key, unicode)
@@ -723,26 +755,27 @@ function widget:keypressed(key, unicode)
 end
 
 function widget:keyreleased(key, unicode)
+  local focused = self:validatefocus()
   if key == "tab" then
-    if not self.focused or self.focused == self then
+    if not focused or focused == self then
       self:focus(self.content[1])
     else
       for i, v in ipairs(self.content) do
-        if self.focused == v then
+        if focused == v then
           self:focus(self.content[i+1])
           break
         end
       end
     end
   else
-    if self.focused ~= self and self.focused then
-      self.focused:keyreleased(key, unicode)
+    if focused ~= self and focused then
+      focused:keyreleased(key, unicode)
     end
     if self:enabled() then
       self.actions.keyup(self, key, unicode)
     end
   end
-  
+
 end
 
 --- Draws the widget and any sub-widget within the widget.
