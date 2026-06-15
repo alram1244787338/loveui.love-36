@@ -17,6 +17,7 @@ function checkbox:init(tags, args)
   
   -- Add checkbox tag.
   self:add("ui.checkbox")
+  self.tabstop = true
   
   self:onclick(function(self, x, y, button)
     self:toggle()

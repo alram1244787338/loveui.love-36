@@ -17,6 +17,7 @@ function button:init(tags, args)
   
   -- Add button tag.
   self:add("ui.button")
+  self.tabstop = true
   
   -- Add button handlers
   self:onmouseenter(function(self, x, y)

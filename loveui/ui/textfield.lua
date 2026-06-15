@@ -20,6 +20,7 @@ function textfield:init(tags, args)
   
   -- Add textfield tag.
   self:add("ui.textfield")
+  self.tabstop = true
   
   local text = self.attributes.value
   

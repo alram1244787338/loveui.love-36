@@ -42,6 +42,10 @@ function widget:init(tags, args)
   
   -- Subwidget that is being interacted with.
   self.focused = nil
+
+  -- Whether this widget participates in tab-focus order.
+  -- Leaf interactive widgets (button, textfield, checkbox) set this to true.
+  self.tabstop = false
   
   -- Actions.
   self.actions = {
@@ -580,22 +584,23 @@ function widget:update(dt)
   end
 end
 
---- Switch focus to self or a subwidget and invoke to appropriate 
+--- Switch focus to self or a subwidget and invoke to appropriate
 -- handlers.
--- @param w The widget to focus. Should be a subwidget or self but this 
+-- @param w The widget to focus. Should be a subwidget or self but this
 -- is not checked by the function.
 function widget:focus(w)
   if self.focused ~= w then
-    if self.focused then
-      self.focused.actions.blur()
+    local old = self.focused
+    if old then
+      old.actions.blur(old)
     end
-    if self.focused then
-      self.focused:remove("ui.focus")
+    if old then
+      old:remove("ui.focus")
     end
     self.focused = w
     if self.focused then
       self.focused:add("ui.focus")
-      self.focused.actions.focus()
+      self.focused.actions.focus(self.focused)
     end
   end
 end
@@ -603,6 +608,65 @@ end
 function widget:enabled()
   local this = self.style.styles
   return this.display ~= "none" and self.attributes.disabled ~= true
+end
+
+--- Returns true if this widget can receive tab focus.
+-- A widget is tab-focusable when its tabstop flag is true and it is
+-- enabled (not disabled, not display=none).
+function widget:focusable()
+  return self.tabstop == true and self:enabled()
+end
+
+--- Collect all focusable widgets in the subtree, depth-first order.
+-- Descends into all children regardless of whether they are focusable,
+-- so nested container widgets are traversed correctly.
+function widget:getfocusables()
+  local result = {}
+  for i, v in ipairs(self.content) do
+    if v:focusable() then
+      table.insert(result, v)
+    end
+    local sub = v:getfocusables()
+    for j, w in ipairs(sub) do
+      table.insert(result, w)
+    end
+  end
+  return result
+end
+
+--- Get the deeply focused widget, descending through nested containers.
+-- Returns the innermost widget that currently holds focus, or nil.
+function widget:deepfocused()
+  if self.focused and self.focused ~= self and self.focused.focused then
+    return self.focused:deepfocused()
+  end
+  return self.focused
+end
+
+--- Focus a target widget that may be deeply nested.
+-- Walks from self down to the target, setting focused at each level
+-- and firing blur/focus callbacks in the correct order.
+-- @param target The widget to focus, or nil to clear focus.
+function widget:focustarget(target)
+  if not target then return end
+  -- Build chain from self down to target by walking up via .owner
+  local chain = {}
+  local w = target
+  while w and w ~= self do
+    table.insert(chain, 1, w)
+    w = w.owner
+  end
+  -- If target is not a descendant of self, just focus it directly
+  if #chain == 0 and target ~= self then
+    self:focus(target)
+    return
+  end
+  -- Focus each level from self downward
+  local current = self
+  for i, next in ipairs(chain) do
+    current:focus(next)
+    current = next
+  end
 end
 
 --- Send mouseleave event to widget, and/or sub-widgets.
@@ -724,16 +788,27 @@ end
 
 function widget:keyreleased(key, unicode)
   if key == "tab" then
-    if not self.focused or self.focused == self then
-      self:focus(self.content[1])
-    else
-      for i, v in ipairs(self.content) do
-        if self.focused == v then
-          self:focus(self.content[i+1])
+    local focusables = self:getfocusables()
+    if #focusables == 0 then
+      -- No focusable widgets at all; do nothing, don't disturb current state.
+      return
+    end
+
+    -- Find the currently focused widget (possibly deep inside a container).
+    local current = self:deepfocused()
+    local nextidx = 1  -- default: first focusable (initial or wraparound)
+
+    if current then
+      for i, v in ipairs(focusables) do
+        if v == current then
+          -- Advance to next, wrapping around to 1 after the last.
+          nextidx = (i % #focusables) + 1
           break
         end
       end
     end
+
+    self:focustarget(focusables[nextidx])
   else
     if self.focused ~= self and self.focused then
       self.focused:keyreleased(key, unicode)
@@ -742,7 +817,7 @@ function widget:keyreleased(key, unicode)
       self.actions.keyup(self, key, unicode)
     end
   end
-  
+
 end
 
 --- Draws the widget and any sub-widget within the widget.
@@ -1029,5 +1104,131 @@ test("ui.widget", function()
     assert(bounds[1] == 0 and bounds[2] == 0, 
       [[bounds[1] == 0 and bounds[2] == 0]])
       
+    return true
+  end)
+
+test("ui.widget.tabstop", function()
+    -- Plain widget has tabstop=false by default.
+    local w = widget("w")
+    assert(w.tabstop == false, "default tabstop is false")
+    -- Manually enable tabstop to simulate an interactive widget.
+    w.tabstop = true
+    assert(w:focusable() == true, "tabstop+enabled = focusable")
+    -- Disabled widget is not focusable.
+    w.attributes.disabled = true
+    assert(w:focusable() == false, "disabled widget not focusable")
+    return true
+  end)
+
+test("ui.widget.getfocusables", function()
+    local root = widget("root")
+    local a = root:add(widget("a"))
+    local b = root:add(widget("b"))
+    local c = root:add(widget("c"))
+    -- Only b and c are "interactive" (tabstop).
+    b.tabstop = true
+    c.tabstop = true
+    root:computestyle()
+    root:computearea()
+    local f = root:getfocusables()
+    assert(#f == 2, "2 focusable widgets")
+    assert(f[1] == b and f[2] == c, "order is b, c")
+    return true
+  end)
+
+test("ui.widget.tab.wraparound", function()
+    local root = widget("root")
+    local a = root:add(widget("a"))
+    local b = root:add(widget("b"))
+    a.tabstop = true
+    b.tabstop = true
+    root:computestyle()
+    root:computearea()
+    -- First tab: focus a
+    root:keyreleased("tab")
+    assert(root:deepfocused() == a, "first tab -> a")
+    -- Second tab: focus b
+    root:keyreleased("tab")
+    assert(root:deepfocused() == b, "second tab -> b")
+    -- Third tab: wraparound to a
+    root:keyreleased("tab")
+    assert(root:deepfocused() == a, "third tab wraps -> a")
+    return true
+  end)
+
+test("ui.widget.tab.skip.disabled", function()
+    local root = widget("root")
+    local a = root:add(widget("a"))
+    local b = root:add(widget("b"))
+    local c = root:add(widget("c"))
+    a.tabstop = true
+    b.tabstop = true
+    c.tabstop = true
+    b.attributes.disabled = true
+    root:computestyle()
+    root:computearea()
+    root:keyreleased("tab")
+    assert(root:deepfocused() == a, "tab -> a")
+    root:keyreleased("tab")
+    assert(root:deepfocused() == c, "tab skips disabled b -> c")
+    return true
+  end)
+
+test("ui.widget.tab.empty", function()
+    local root = widget("root")
+    local lbl = root:add(widget("lbl"))
+    -- lbl has tabstop=false, so no focusables.
+    root:computestyle()
+    root:computearea()
+    -- Should not error, and focus state should remain unchanged.
+    root:keyreleased("tab")
+    assert(root.focused == nil, "no crash, focus stays nil")
+    return true
+  end)
+
+test("ui.widget.tab.nested", function()
+    local root = widget("root")
+    local a = root:add(widget("a"))
+    a.tabstop = true
+    local form = root:add(widget("form"))
+    local b = form:add(widget("b"))
+    local c = form:add(widget("c"))
+    b.tabstop = true
+    c.tabstop = true
+    root:computestyle()
+    root:computearea()
+    root:keyreleased("tab")
+    assert(root:deepfocused() == a, "tab -> a")
+    root:keyreleased("tab")
+    assert(root:deepfocused() == b, "tab -> b (inside form)")
+    assert(root.focused == form, "root.focused points to form")
+    root:keyreleased("tab")
+    assert(root:deepfocused() == c, "tab -> c")
+    root:keyreleased("tab")
+    assert(root:deepfocused() == a, "tab wraps -> a")
+    return true
+  end)
+
+test("ui.widget.tab.blur.focus.order", function()
+    local root = widget("root")
+    local a = root:add(widget("a"))
+    local b = root:add(widget("b"))
+    a.tabstop = true
+    b.tabstop = true
+    root:computestyle()
+    root:computearea()
+    local log = {}
+    a.actions.blur:add(function(self) table.insert(log, "blur-a") end)
+    a.actions.focus:add(function(self) table.insert(log, "focus-a") end)
+    b.actions.blur:add(function(self) table.insert(log, "blur-b") end)
+    b.actions.focus:add(function(self) table.insert(log, "focus-b") end)
+    -- First tab: focus a (no prior blur)
+    root:keyreleased("tab")
+    assert(#log == 1 and log[1] == "focus-a", "first tab fires focus-a only")
+    -- Second tab: blur a, then focus b
+    root:keyreleased("tab")
+    assert(#log == 3, "3 events total")
+    assert(log[2] == "blur-a", "blur-a fires before focus-b")
+    assert(log[3] == "focus-b", "focus-b fires after blur-a")
     return true
   end)
