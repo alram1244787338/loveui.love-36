@@ -585,24 +585,74 @@ end
 -- @param w The widget to focus. Should be a subwidget or self but this 
 -- is not checked by the function.
 function widget:focus(w)
-  if self.focused ~= w then
-    if self.focused then
-      self.focused.actions.blur()
-    end
-    if self.focused then
-      self.focused:remove("ui.focus")
-    end
-    self.focused = w
-    if self.focused then
-      self.focused:add("ui.focus")
-      self.focused.actions.focus()
-    end
+  if self.focused == w then return end
+  -- Tear down the previously focused widget completely before switching:
+  -- clear its visual focus state first, then fire its blur handler. Doing
+  -- both up front guarantees we never leave a stale highlight or a pending
+  -- callback on the old widget once focus has conceptually moved on.
+  local old = self.focused
+  if old then
+    old:remove("ui.focus")
+    old.actions.blur()
+  end
+  -- Move the focus pointer to the new widget.
+  self.focused = w
+  -- Bring the newly focused widget fully into focus: set its visual state
+  -- first, then fire its focus handler, so the highlight and the callback
+  -- always stay in sync with self.focused.
+  if w then
+    w:add("ui.focus")
+    w.actions.focus()
   end
 end
 
 function widget:enabled()
   local this = self.style.styles
   return this.display ~= "none" and self.attributes.disabled ~= true
+end
+
+--- Returns whether the widget can currently receive keyboard (tab) focus.
+-- A widget is focusable when it is enabled (shown, i.e. not
+-- <code>display = "none"</code>, and not <code>disabled</code>) and has not
+-- explicitly opted out of focus via the <code>focusable = false</code>
+-- attribute.
+-- @return <code>true</code> if the widget may be focused via tab.
+function widget:focusable()
+  return self:enabled() and self.attributes.focusable ~= false
+end
+
+--- Finds the next focusable sub-widget after <code>from</code>, wrapping
+-- around to the start of <code>self.content</code> once the end is reached.
+-- Sub-widgets that are not focusable (disabled, <code>display = "none"</code>,
+-- or opted out) are skipped.
+-- @param from The currently focused sub-widget, or <code>nil</code> to start
+-- the search from the first sub-widget.
+-- @return The next focusable sub-widget, or <code>nil</code> when none of the
+-- sub-widgets can take focus.
+function widget:nextfocusable(from)
+  local n = #self.content
+  if n == 0 then return nil end
+  -- Locate `from` so the scan can begin right after it. When `from` is nil
+  -- or is not one of the sub-widgets, start stays 0 so the scan begins at
+  -- the first sub-widget.
+  local start = 0
+  for i, v in ipairs(self.content) do
+    if v == from then
+      start = i
+      break
+    end
+  end
+  -- Walk the n slots that follow `start`, wrapping past the end of the list,
+  -- and return the first sub-widget that can take focus. Scanning exactly n
+  -- slots visits every sub-widget once, so a lone focusable `from` is simply
+  -- returned again (a stable no-op) and an all-unfocusable list yields nil.
+  for step = 1, n do
+    local w = self.content[(start + step - 1) % n + 1]
+    if w:focusable() then
+      return w
+    end
+  end
+  return nil
 end
 
 --- Send mouseleave event to widget, and/or sub-widgets.
@@ -724,15 +774,19 @@ end
 
 function widget:keyreleased(key, unicode)
   if key == "tab" then
-    if not self.focused or self.focused == self then
-      self:focus(self.content[1])
-    else
-      for i, v in ipairs(self.content) do
-        if self.focused == v then
-          self:focus(self.content[i+1])
-          break
-        end
-      end
+    -- Cycle keyboard focus through the focusable direct sub-widgets, in
+    -- order, wrapping back to the first one after the last. A widget that is
+    -- focusing itself counts as "no sub-widget focused yet".
+    local current = self.focused
+    if current == self then
+      current = nil
+    end
+    local target = self:nextfocusable(current)
+    -- Only move focus when a focusable sub-widget exists. Otherwise leave the
+    -- current focus untouched, so an empty or all-disabled container is a
+    -- safe no-op instead of an error or a dropped focus.
+    if target then
+      self:focus(target)
     end
   else
     if self.focused ~= self and self.focused then
@@ -742,7 +796,7 @@ function widget:keyreleased(key, unicode)
       self.actions.keyup(self, key, unicode)
     end
   end
-  
+
 end
 
 --- Draws the widget and any sub-widget within the widget.
@@ -1026,8 +1080,82 @@ test("ui.widget", function()
     
     bounds = child:computebounds()
     -- Check left and top are both 0
-    assert(bounds[1] == 0 and bounds[2] == 0, 
+    assert(bounds[1] == 0 and bounds[2] == 0,
       [[bounds[1] == 0 and bounds[2] == 0]])
-      
+
+    return true
+  end)
+
+-- Tab focus: moves forward through children and wraps past the last one.
+test("ui.widget.focus.tab", function()
+    local root = widget("root")
+    local a = root:add(widget("a"))
+    local b = root:add(widget("b"))
+    local c = root:add(widget("c"))
+    assert(root.focused == nil, [[root.focused == nil]])
+    root:keyreleased("tab")
+    assert(root.focused == a, [[tab focuses first child]])
+    root:keyreleased("tab")
+    assert(root.focused == b, [[tab moves to second child]])
+    root:keyreleased("tab")
+    assert(root.focused == c, [[tab moves to third child]])
+    root:keyreleased("tab")
+    assert(root.focused == a, [[tab wraps from last back to first]])
+    return true
+  end)
+
+-- Tab focus: skips disabled and display:none children while cycling.
+test("ui.widget.focus.skip", function()
+    local root = widget("root")
+    local a = root:add(widget("a"))
+    local b = root:add(widget("b"))
+    local c = root:add(widget("c"))
+    local d = root:add(widget("d hidden"))
+    root:add(style("hidden", {display = "none"}))
+    b.attributes.disabled = true
+    root:keyreleased("tab")
+    assert(root.focused == a, [[first tab focuses a]])
+    root:keyreleased("tab")
+    assert(root.focused == c, [[tab skips disabled b]])
+    root:keyreleased("tab")
+    assert(root.focused == a, [[tab skips hidden d and wraps to a]])
+    return true
+  end)
+
+-- Tab focus: an empty or all-disabled container is a safe no-op.
+test("ui.widget.focus.empty", function()
+    local root = widget("root")
+    root:keyreleased("tab")
+    assert(root.focused == nil, [[tab on empty container keeps focus nil]])
+    local a = root:add(widget("a"))
+    a.attributes.disabled = true
+    root:keyreleased("tab")
+    assert(root.focused == nil, [[tab with only disabled children is a no-op]])
+    return true
+  end)
+
+-- Tab focus: focus/blur callbacks fire in sync with the ui.focus visual
+-- state and the focused pointer.
+test("ui.widget.focus.order", function()
+    local root = widget("root")
+    local a = root:add(widget("a"))
+    local b = root:add(widget("b"))
+    local log = {}
+    a:onfocus(function()
+      table.insert(log, "a-focus:" .. tostring(a:match("ui.focus") == true))
+    end)
+    a:onblur(function()
+      table.insert(log, "a-blur:" .. tostring(a:match("ui.focus") == true))
+    end)
+    b:onfocus(function()
+      table.insert(log, "b-focus:" .. tostring(b:match("ui.focus") == true))
+    end)
+    root:keyreleased("tab")
+    root:keyreleased("tab")
+    assert(log[1] == "a-focus:true", [[focus fires with visual tag already set]])
+    assert(log[2] == "a-blur:false", [[blur fires after visual tag cleared]])
+    assert(log[3] == "b-focus:true", [[new focus fires with its visual tag set]])
+    assert(not a:match("ui.focus"), [[old widget lost ui.focus]])
+    assert(b:match("ui.focus"), [[new widget has ui.focus]])
     return true
   end)
