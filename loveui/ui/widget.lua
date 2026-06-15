@@ -161,6 +161,19 @@ function widget:removewidget(w)
   if not self:owns(w) then
     error("A widget cannot remove a widget it does not own.")
   end
+
+  -- If the widget is in the focus chain, defocus it and its focus descendants.
+  if self:haswidget(w) and self.focused and
+     (self.focused == w or w:haswidget(self.focused)) then
+    self:defocus(w)
+    self.focused = nil
+  end
+
+  -- Clean up interaction states on the removed widget.
+  if w:match("ui.focus") then w:remove("ui.focus") end
+  if w:match("ui.hover") then w:remove("ui.hover") end
+  if w:match("ui.pressed") then w:remove("ui.pressed") end
+
   for i, v in ipairs(self.content) do
     if v == w then
       table.remove(self.content, i);
@@ -211,6 +224,18 @@ function widget:owns(...)
     end
   end
   return unpack(results)
+end
+
+--- Checks whether a widget is a descendant (or equal to) of this widget.
+-- @param w The widget to check.
+-- @return Returns <code>true</code> if the widget is in this widget's subtree.
+function widget:haswidget(w)
+  local current = w
+  while current do
+    if current == self then return true end
+    current = current.owner
+  end
+  return false
 end
 
 --- Remove elements from the widget.
@@ -588,8 +613,6 @@ function widget:focus(w)
   if self.focused ~= w then
     if self.focused then
       self.focused.actions.blur()
-    end
-    if self.focused then
       self.focused:remove("ui.focus")
     end
     self.focused = w
@@ -597,6 +620,21 @@ function widget:focus(w)
       self.focused:add("ui.focus")
       self.focused.actions.focus()
     end
+  end
+end
+
+--- Clear focus from a widget and its focus chain without affecting self.focused.
+-- Fires blur callbacks and removes "ui.focus" tags down the chain.
+-- @param w The widget to defocus.
+function widget:defocus(w)
+  if w == nil then return end
+  if w:match("ui.focus") then
+    w:remove("ui.focus")
+    w.actions.blur()
+  end
+  if w.focused then
+    w:defocus(w.focused)
+    w.focused = nil
   end
 end
 
@@ -698,7 +736,7 @@ end
 function widget:mousereleased(x, y, button)
   if not self.bounds then self:computebounds() end
   local wx, wy, ww, wh = unpack(self.bounds)
-  if self.focused ~= nil and self.focused ~= self then
+  if self.focused ~= nil and self.focused ~= self and self:owns(self.focused) then
     if self.focused:enabled() and self.focused:contains(x - wx, y - wy) and
         self.focused:mousereleased(x - wx, y - wy, button)  then
        return true
@@ -714,7 +752,7 @@ function widget:mousereleased(x, y, button)
 end
 
 function widget:keypressed(key, unicode)
-  if self.focused ~= self and self.focused then
+  if self.focused ~= self and self.focused and self:owns(self.focused) then
     self.focused:keypressed(key, unicode)
   end
   if self:enabled() then
@@ -725,24 +763,30 @@ end
 function widget:keyreleased(key, unicode)
   if key == "tab" then
     if not self.focused or self.focused == self then
-      self:focus(self.content[1])
+      if self.content[1] then
+        self:focus(self.content[1])
+      end
     else
       for i, v in ipairs(self.content) do
         if self.focused == v then
-          self:focus(self.content[i+1])
+          if self.content[i+1] then
+            self:focus(self.content[i+1])
+          else
+            self:focus(nil)
+          end
           break
         end
       end
     end
   else
-    if self.focused ~= self and self.focused then
+    if self.focused ~= self and self.focused and self:owns(self.focused) then
       self.focused:keyreleased(key, unicode)
     end
     if self:enabled() then
       self.actions.keyup(self, key, unicode)
     end
   end
-  
+
 end
 
 --- Draws the widget and any sub-widget within the widget.
@@ -1029,5 +1073,74 @@ test("ui.widget", function()
     assert(bounds[1] == 0 and bounds[2] == 0, 
       [[bounds[1] == 0 and bounds[2] == 0]])
       
+    return true
+  end)
+
+test("ui.widget.focus_cleanup", function()
+    -- Test 1: Remove focused widget clears focus and fires blur
+    local parent = widget("parent")
+    local child1 = parent:add(widget("child1"))
+    local child2 = parent:add(widget("child2"))
+    local blur_count = 0
+
+    child1:onblur(function() blur_count = blur_count + 1 end)
+
+    parent:focus(child1)
+    assert(parent.focused == child1, "child1 should be focused")
+    assert(child1:match("ui.focus"), "child1 should have ui.focus tag")
+
+    parent:removewidget(child1)
+    assert(parent.focused == nil, "focus should be nil after removing focused widget")
+    assert(blur_count == 1, "blur should have fired once, got " .. tostring(blur_count))
+    assert(not child1:match("ui.focus"), "removed widget should not have ui.focus tag")
+    assert(child1.owner == nil, "removed widget should have nil owner")
+
+    -- Test 2: Remove non-focused widget does not affect focus
+    parent:focus(child2)
+    local other = parent:add(widget("other"))
+    parent:removewidget(other)
+    assert(parent.focused == child2, "focus should not change when removing non-focused widget")
+
+    -- Test 3: Batch remove via remove(...)
+    local blur2 = 0
+    child2:onblur(function() blur2 = blur2 + 1 end)
+    local child3 = parent:add(widget("child3"))
+    parent:focus(child2)
+
+    parent:remove(child2, child3)
+    assert(parent.focused == nil, "focus should be nil after batch removing focused widget")
+    assert(blur2 == 1, "blur should fire on batch remove")
+
+    -- Test 4: Remove container with focused descendants
+    local root = widget("root")
+    local container = root:add(widget("container"))
+    local inner = container:add(widget("inner"))
+    local inner_blur = 0
+    inner:onblur(function() inner_blur = inner_blur + 1 end)
+
+    root:focus(container)
+    container:focus(inner)
+    assert(root.focused == container, "root should focus container")
+    assert(container.focused == inner, "container should focus inner")
+    assert(inner:match("ui.focus"), "inner should have ui.focus")
+
+    root:removewidget(container)
+    assert(root.focused == nil, "root focus should be nil")
+    assert(inner_blur == 1, "blur should fire on nested focused widget")
+    assert(not inner:match("ui.focus"), "inner should not have ui.focus after container removal")
+    assert(not container:match("ui.focus"), "container should not have ui.focus after removal")
+
+    -- Test 5: haswidget helper
+    local r = widget("r")
+    local a = r:add(widget("a"))
+    local b = a:add(widget("b"))
+    local c = widget("c")
+
+    assert(r:haswidget(a) == true, "r should have a")
+    assert(r:haswidget(b) == true, "r should have b (descendant)")
+    assert(r:haswidget(r) == true, "r should have itself")
+    assert(r:haswidget(c) == false, "r should not have unrelated c")
+    assert(a:haswidget(c) == false, "a should not have unrelated c")
+
     return true
   end)
